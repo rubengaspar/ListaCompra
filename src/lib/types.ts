@@ -3,6 +3,7 @@
 // cada Tienda concreta apunta a un TipoTienda (Eroski → Supermercado, etc.).
 
 export type Unit = 'unidad' | 'kg' | 'g' | 'l' | 'ml' | 'paquete' | 'docena' | 'caja';
+export type ItemPriority = 'low' | 'normal' | 'high';
 
 export type IconRef =
   | { kind: 'emoji'; value: string }            // p.ej. "🥩"
@@ -45,6 +46,8 @@ export interface Store {
   edited?: boolean;
   /** Tarjeta de fidelización de esta tienda (opcional). */
   loyalty?: LoyaltyCard;
+  /** Enables product-page links for this store's shopping-list items. */
+  online?: boolean;
 }
 
 /** Categoría dentro de un tipo de tienda */
@@ -54,6 +57,14 @@ export interface Category {
   typeId: StoreType['id'];
   icon: IconRef;
   order?: number;
+}
+
+/** Product manufacturer or brand owner (ETI, DOST, etc.). */
+export interface Company {
+  id: string;
+  name: string;
+  /** Legacy snapshots may still contain the former plain emoji string. */
+  icon?: IconRef | string;
 }
 
 /** Producto del catálogo (plantilla — no es una entrada de lista todavía) */
@@ -82,6 +93,9 @@ export interface ListItem {
   unit: Unit;
   done: boolean;
   note?: string;
+  priority?: ItemPriority;
+  /** Optional product page for online-store list items. */
+  url?: string;
   addedAt: number;             // timestamp
   doneAt?: number;
 }
@@ -109,6 +123,12 @@ export interface AppState {
   storeTypes: StoreType[];     // catálogo (puede sobreescribir el seed)
   stores: Store[];
   categories: Category[];
+  /** User-managed companies and catalog overrides. Optional for old snapshots. */
+  companies?: Company[];
+  /** One-time default-company migrations without restoring companies the user deleted. */
+  companySeedVersion?: number;
+  categoryOverrides?: Record<Category['id'], Pick<Category, 'name' | 'icon'>>;
+  productCompanies?: Record<Product['id'], Company['id']>;
   products: Product[];
   lists: Record<Store['id'], ShoppingList>;
   /** Frecuencia de uso por tienda y producto. Se incrementa cada vez que el
@@ -122,7 +142,7 @@ export interface AppState {
   /** Locale del catálogo (tiendas/productos/idioma de nombres). Se deriva del
    *  idioma/país de Home Assistant, o del navegador fuera de él. Si el idioma no
    *  es ninguno de los soportados, DEFAULT_LOCALE ('en'). */
-  locale?: 'es' | 'en' | 'us' | 'fr' | 'de' | 'br';
+  locale?: 'es' | 'en' | 'us' | 'fr' | 'de' | 'br' | 'tr' | 'ar';
   /** Icono elegido por el usuario para un producto, incluidos los del seed.
    *
    *  Vive APARTE de `products` porque refreshSeed() reemplaza el seed entero en

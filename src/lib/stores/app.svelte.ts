@@ -1,15 +1,18 @@
 // Store global con Svelte 5 runes. Una única fuente de verdad para toda la app.
 // Se hidrata desde LocalStorage al iniciar y se autoguarda al cambiar.
 
-import type { AppState, IconRef, ListItem, Product, ShoppingList, Store, UserProfile } from '../types';
-import { createInitialState, loadState, saveState } from '../storage';
-import { getLocalizedSeed, LOCALIZED_STORES } from '../data/locales';
+import type { AppState, Category, Company, IconRef, ListItem, Product, ShoppingList, Store, UserProfile } from '../types';
+import { COMPANY_SEED_VERSION, createInitialState, DEFAULT_COMPANIES, loadState, saveState } from '../storage';
+import { getLocalizedSeed, LOCALIZED_STORES, RETIRED_SEED_STORE_IDS } from '../data/locales';
 import { DEFAULT_LOCALE, LOCALES, type Locale } from '../i18n/locale';
 
 // IDs de tienda de TODOS los locales: sirve para distinguir "tienda de seed
 // (de cualquier idioma)" de "tienda custom del usuario".
 const ALL_SEED_STORE_IDS = new Set(
-  LOCALES.flatMap((l) => LOCALIZED_STORES[l].map((s) => s.id)),
+  [
+    ...LOCALES.flatMap((l) => LOCALIZED_STORES[l].map((s) => s.id)),
+    ...RETIRED_SEED_STORE_IDS,
+  ],
 );
 
 class AppStore {
@@ -25,6 +28,18 @@ class AppStore {
     const seedStoreIds = new Set(seed.stores.map((s) => s.id));
     const seedCategoryIds = new Set(seed.categories.map((c) => c.id));
 
+    // Limpia los restos de seeds retirados en instalaciones ya existentes.
+    // Los IDs son históricos y reservados, así que no afectan tiendas custom.
+    for (const id of RETIRED_SEED_STORE_IDS) {
+      delete this.state.lists[id];
+      if (this.state.usage) delete this.state.usage[id];
+    }
+    if (this.state.defaultStores) {
+      for (const [typeId, storeId] of Object.entries(this.state.defaultStores)) {
+        if (RETIRED_SEED_STORE_IDS.has(storeId)) delete this.state.defaultStores[typeId];
+      }
+    }
+
     // Tiendas:
     //  - Editadas por el usuario (edited) del locale actual: se respetan.
     //  - Seed normales del locale actual: refresh preservando order/enabled.
@@ -35,6 +50,7 @@ class AppStore {
     const editedSeedStores = this.state.stores.filter(
       (s) => seedStoreIds.has(s.id) && s.edited,
     );
+    const seedById = new Map(seed.stores.map((s) => [s.id, s]));
     const editedSeedIds = new Set(editedSeedStores.map((s) => s.id));
 
     this.state.stores = [
@@ -44,14 +60,24 @@ class AppStore {
           const local = localById.get(s.id);
           return { ...s, order: local?.order ?? s.order, enabled: local?.enabled ?? s.enabled };
         }),
-      ...editedSeedStores,
+      ...editedSeedStores.map((s) => ({
+        ...s,
+        online: s.online ?? seedById.get(s.id)?.online,
+      })),
       ...customStores,
     ];
 
     // Categorías y productos: refresco completo del seed localizado; preservamos
     // los custom (categorías no-seed, productos con prefijo custom-).
     const customCategories = this.state.categories.filter((c) => !seedCategoryIds.has(c.id));
-    this.state.categories = [...seed.categories, ...customCategories];
+    const categoryOverrides = this.state.categoryOverrides ?? {};
+    this.state.categories = [
+      ...seed.categories.map((category) => ({
+        ...category,
+        ...(categoryOverrides[category.id] ?? {}),
+      })),
+      ...customCategories,
+    ];
 
     const customProducts = this.state.products.filter((p) => p.id.startsWith('custom-'));
     this.state.products = [...seed.products, ...customProducts];
@@ -78,6 +104,11 @@ class AppStore {
     this.persist();
   }
 
+  /** Re-applies seed data after synchronized catalog metadata changes. */
+  refreshCatalog(): void {
+    this.refreshSeed();
+  }
+
   /** ¿Tiene este producto un icono puesto por el usuario? */
   hasCustomIcon(id: Product['id']): boolean {
     return !!this.state.productIcons?.[id];
@@ -94,6 +125,7 @@ class AppStore {
   hydrate(): void {
     if (this.hydrated) return;
     this.state = loadState();
+    this.ensureCompanySeed();
     this.refreshSeed();
     this.hydrated = true;
     saveState(this.state);
@@ -142,6 +174,67 @@ class AppStore {
       }
     }
     this.persist();
+  }
+
+  // -------- Companies and categories --------
+  ensureCompanySeed(): void {
+    if ((this.state.companySeedVersion ?? 0) >= COMPANY_SEED_VERSION) return;
+    const existing = new Set((this.state.companies ?? []).map((company) => company.id));
+    this.state.companies ??= [];
+    this.state.companies.push(
+      ...DEFAULT_COMPANIES.filter((company) => !existing.has(company.id)).map((company) => ({ ...company })),
+    );
+    this.state.companySeedVersion = COMPANY_SEED_VERSION;
+  }
+
+  upsertCompany(company: Company): void {
+    this.state.companies ??= [];
+    const clean = { ...company, name: company.name.trim() };
+    const index = this.state.companies.findIndex((candidate) => candidate.id === company.id);
+    if (index >= 0) this.state.companies[index] = clean;
+    else this.state.companies.push(clean);
+    this.persist();
+  }
+
+  removeCompany(id: string): void {
+    this.state.companies = (this.state.companies ?? []).filter((company) => company.id !== id);
+    for (const [productId, companyId] of Object.entries(this.state.productCompanies ?? {})) {
+      if (companyId === id) delete this.state.productCompanies![productId];
+    }
+    this.persist();
+  }
+
+  setProductCompany(productId: string, companyId?: string): void {
+    this.state.productCompanies ??= {};
+    if (companyId) this.state.productCompanies[productId] = companyId;
+    else delete this.state.productCompanies[productId];
+    this.persist();
+  }
+
+  upsertCategory(category: Category): void {
+    const seed = getLocalizedSeed(this.state.locale ?? DEFAULT_LOCALE);
+    const isSeed = seed.categories.some((candidate) => candidate.id === category.id);
+    if (isSeed) {
+      this.state.categoryOverrides ??= {};
+      this.state.categoryOverrides[category.id] = {
+        name: category.name.trim(),
+        icon: category.icon,
+      };
+      this.refreshSeed();
+    } else {
+      const index = this.state.categories.findIndex((candidate) => candidate.id === category.id);
+      if (index >= 0) this.state.categories[index] = category;
+      else this.state.categories.push(category);
+    }
+    this.persist();
+  }
+
+  removeCategory(id: string): boolean {
+    if (this.state.products.some((product) => product.categoryId === id)) return false;
+    this.state.categories = this.state.categories.filter((category) => category.id !== id);
+    if (this.state.categoryOverrides) delete this.state.categoryOverrides[id];
+    this.persist();
+    return true;
   }
 
   // -------- Tienda por defecto por tipo (enrutado por voz) --------
@@ -352,6 +445,39 @@ class AppStore {
     const it = list.items.find((i) => i.id === itemId);
     if (!it) return;
     it.unit = unit;
+    list.updatedAt = Date.now();
+    this.persist();
+  }
+
+  setItemUrl(storeId: string, itemId: string, url?: string): void {
+    const list = this.state.lists[storeId];
+    if (!list) return;
+    const it = list.items.find((i) => i.id === itemId);
+    if (!it) return;
+    if (url) it.url = url;
+    else delete it.url;
+    list.updatedAt = Date.now();
+    this.persist();
+  }
+
+  setItemDetails(
+    storeId: string,
+    itemId: string,
+    details: Pick<ListItem, 'note' | 'priority'> & Partial<Pick<ListItem, 'url'>>,
+  ): void {
+    const list = this.state.lists[storeId];
+    if (!list) return;
+    const it = list.items.find((i) => i.id === itemId);
+    if (!it) return;
+    const note = details.note?.trim();
+    if (note) it.note = note;
+    else delete it.note;
+    if (details.priority && details.priority !== 'normal') it.priority = details.priority;
+    else delete it.priority;
+    if ('url' in details) {
+      if (details.url) it.url = details.url;
+      else delete it.url;
+    }
     list.updatedAt = Date.now();
     this.persist();
   }
